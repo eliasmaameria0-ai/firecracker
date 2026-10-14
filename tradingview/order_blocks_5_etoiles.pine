@@ -1,0 +1,264 @@
+//@version=6
+// Order Blocks 5 étoiles — d'après la méthode "les 4 secrets des order blocks" (Casper).
+//
+// Un order block = la dernière bougie inverse avant un mouvement violent qui casse la structure.
+// Chaque OB reçoit une note sur 5 :
+//   ★ 1. OB valide        : mouvement violent (≥ X × ATR) après la bougie inverse
+//   ★ 2. Tendance          : OB dans le sens de la structure (BOS, pas CHoCH) + EMA UT sup. (option)
+//   ★ 3. Imbalance         : le mouvement libère un FVG (gap entre bougie 1 et 3) d'une taille minimale
+//   ★ 4. Non mitigé        : la zone n'a jamais été touchée depuis sa création
+//   ★ 5. Liquidité         : la jambe qui forme l'OB a chassé un swing précédent (stops pris)
+// La note est figée au premier retour du prix dans la zone (= moment de l'entrée).
+indicator("Order Blocks 5 Étoiles", "OB 5★", overlay = true, max_boxes_count = 500, max_bars_back = 500)
+
+// ───────────────────────── Paramètres ─────────────────────────
+const string G1 = "Détection des order blocks"
+swingLen   = input.int(5, "Longueur des swings (structure)", minval = 2, group = G1)
+obLookback = input.int(30, "Recherche de l'OB (barres max)", minval = 3, maxval = 200, group = G1)
+dispMult   = input.float(2.0, "Mouvement violent minimum (× ATR)", minval = 0.5, step = 0.25, group = G1)
+
+const string G2 = "Les 4 secrets"
+requireBos  = input.bool(true, "Tendance : l'OB doit naître d'un BOS (pas d'un CHoCH)", group = G2)
+useHtf      = input.bool(false, "Tendance : confirmer avec une EMA d'unité supérieure", group = G2)
+htfTf       = input.timeframe("240", "Unité de temps supérieure", group = G2)
+htfLen      = input.int(200, "Longueur EMA", minval = 1, group = G2)
+fvgMinAtr   = input.float(0.3, "Imbalance minimale (× ATR)", minval = 0.0, step = 0.05, group = G2)
+liqLookback = input.int(100, "Liquidité : âge max du swing chassé (barres)", minval = 10, group = G2)
+
+const string G3 = "Affichage"
+minStars    = input.int(5, "Étoiles minimum pour afficher", minval = 1, maxval = 5, group = G3)
+maxZones    = input.int(30, "Zones suivies max par sens", minval = 1, maxval = 100, group = G3)
+showTouched = input.bool(true, "Garder les zones touchées (grisées)", group = G3)
+showLegend  = input.bool(true, "Afficher la légende", group = G3)
+bullCol     = input.color(color.new(#089981, 75), "OB haussier", group = G3)
+bearCol     = input.color(color.new(#f23645, 75), "OB baissier", group = G3)
+touchCol    = input.color(color.new(#787b86, 85), "OB touché", group = G3)
+
+// ───────────────────────── Types & helpers ─────────────────────────
+type OB
+    box   zone
+    float top
+    float bottom
+    bool  bull
+    int   created
+    bool  bornInTrend
+    bool  disp
+    bool  fvg
+    bool  sweep
+    bool  touched = false
+    bool  dead    = false
+    int   score   = 0
+
+float atr = ta.atr(14)
+float htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_on)
+bool htfBull = not useHtf or close > htfEma
+bool htfBear = not useHtf or close < htfEma
+
+var int trend = 0 // 1 = structure haussière, -1 = baissière
+
+starText(int s) =>
+    string t = ""
+    for i = 1 to 5
+        t += i <= s ? "★" : "☆"
+    t
+
+// Bougie extrême de la jambe (bas pour un OB haussier, haut pour un OB baissier).
+legExtreme(bool bull, int n) =>
+    int   bi  = 1
+    float ext = bull ? low[1] : high[1]
+    for i = 1 to n
+        if bull ? low[i] < ext : high[i] > ext
+            ext := bull ? low[i] : high[i]
+            bi  := i
+    [bi, ext]
+
+// Dernière bougie inverse avant le mouvement violent, cherchée entre la cassure et le bas/haut de jambe.
+findOB(bool bull, int bi, float minMove) =>
+    int   idx     = na
+    int   lastOpp = na
+    float run     = bull ? high : low
+    for i = 1 to bi
+        bool opp = bull ? close[i] < open[i] : close[i] > open[i]
+        if opp
+            float move = bull ? run - high[i] : low[i] - run
+            if na(idx) and move >= minMove
+                idx := i
+            lastOpp := i
+        run := bull ? math.max(run, high[i]) : math.min(run, low[i])
+    bool ok = not na(idx)
+    [ok ? idx : na(lastOpp) ? bi : lastOpp, ok]
+
+// Imbalance (FVG) libérée entre la bougie OB et la cassure.
+hasFvg(bool bull, int idx, float minGap) =>
+    bool found = false
+    if idx >= 2
+        for k = 0 to idx - 2
+            float gap = bull ? low[k] - high[k + 2] : low[k + 2] - high[k]
+            if gap > 0 and gap >= minGap
+                found := true
+                break
+    found
+
+// La jambe a-t-elle chassé l'un des 2 derniers swings (poche de liquidité) formés avant elle ?
+tookLiquidity(array<float> vals, array<int> bars, int refBar, float extreme, bool bull) =>
+    bool took    = false
+    int  checked = 0
+    int  n       = vals.size()
+    if n > 0
+        for j = n - 1 to 0
+            int b = bars.get(j)
+            if b < refBar
+                if refBar - b > liqLookback or checked >= 2
+                    break
+                checked += 1
+                if bull ? extreme < vals.get(j) : extreme > vals.get(j)
+                    took := true
+                    break
+    took
+
+trendOk(OB o) =>
+    bool structOk = o.bull ? trend == 1 and htfBull : trend == -1 and htfBear
+    structOk and (not requireBos or o.bornInTrend)
+
+calcScore(OB o) =>
+    (o.disp ? 1 : 0) + (trendOk(o) ? 1 : 0) + (o.fvg ? 1 : 0) + (o.touched ? 0 : 1) + (o.sweep ? 1 : 0)
+
+render(OB o) =>
+    bool  visible = o.score >= minStars and (not o.touched or showTouched)
+    color bg      = o.touched ? touchCol : o.bull ? bullCol : bearCol
+    string state  = o.dead ? "  ✖ invalidé" : o.touched ? "  touché" : ""
+    o.zone.set_bgcolor(visible ? bg : color.new(bg, 100))
+    o.zone.set_border_color(visible ? bg : color.new(bg, 100))
+    o.zone.set_text(visible ? starText(o.score) + state : "")
+
+newOB(bool bull, int idx, bool born, bool disp, bool fvg, bool sweep) =>
+    box b = box.new(bar_index - idx, high[idx], bar_index, low[idx], extend = extend.right,
+             text_size = size.small, text_color = chart.fg_color, text_halign = text.align_right)
+    OB.new(b, high[idx], low[idx], bull, bar_index, born, disp, fvg, sweep)
+
+addOB(array<OB> obs, OB o) =>
+    obs.push(o)
+    if obs.size() > maxZones
+        OB old = obs.shift()
+        if old.score < minStars
+            old.zone.delete()
+        else
+            old.zone.set_extend(extend.none)
+            old.zone.set_right(bar_index)
+
+// Met à jour les zones : note en direct tant que vierge, figée au premier contact.
+// Retourne [nombre d'entrées sur OB 5★, nombre de nouveaux OB 5★].
+processOBs(array<OB> obs) =>
+    int entries = 0
+    int fresh   = 0
+    if obs.size() > 0
+        for i = obs.size() - 1 to 0
+            OB o = obs.get(i)
+            if not o.touched
+                o.score := calcScore(o)
+                if o.created == bar_index and o.score == 5
+                    fresh += 1
+                if bar_index > o.created and (o.bull ? low <= o.top : high >= o.bottom)
+                    if o.score == 5
+                        entries += 1
+                    o.touched := true
+                    o.zone.set_extend(extend.none)
+                    o.zone.set_right(bar_index)
+            if o.bull ? close < o.bottom : close > o.top
+                o.dead := true
+                o.zone.set_extend(extend.none)
+                o.zone.set_right(bar_index)
+                render(o)
+                obs.remove(i)
+                if o.score < minStars or not showTouched
+                    o.zone.delete()
+                continue
+            render(o)
+    [entries, fresh]
+
+// ───────────────────────── Structure de marché ─────────────────────────
+float ph = ta.pivothigh(high, swingLen, swingLen)
+float pl = ta.pivotlow(low, swingLen, swingLen)
+
+var array<float> shVals = array.new<float>()
+var array<int>   shBars = array.new<int>()
+var array<float> slVals = array.new<float>()
+var array<int>   slBars = array.new<int>()
+var float shLvl = na
+var int   shBar = na
+var bool  shBroken = true
+var float slLvl = na
+var int   slBar = na
+var bool  slBroken = true
+
+if not na(ph)
+    shLvl    := ph
+    shBar    := bar_index - swingLen
+    shBroken := false
+    shVals.push(ph)
+    shBars.push(shBar)
+    if shVals.size() > 50
+        shVals.shift()
+        shBars.shift()
+
+if not na(pl)
+    slLvl    := pl
+    slBar    := bar_index - swingLen
+    slBroken := false
+    slVals.push(pl)
+    slBars.push(slBar)
+    if slVals.size() > 50
+        slVals.shift()
+        slBars.shift()
+
+var array<OB> bullOBs = array.new<OB>()
+var array<OB> bearOBs = array.new<OB>()
+
+// Cassure haussière (clôture au-dessus du dernier swing high) → OB haussier
+if not shBroken and close > shLvl
+    shBroken := true
+    bool born = trend == 1
+    trend := 1
+    int n = math.min(obLookback, bar_index - shBar)
+    if n >= 1
+        [bi, ext] = legExtreme(true, n)
+        [idx, disp] = findOB(true, bi, dispMult * atr)
+        bool fvg   = hasFvg(true, idx, fvgMinAtr * atr)
+        bool sweep = tookLiquidity(slVals, slBars, bar_index - bi, ext, true)
+        addOB(bullOBs, newOB(true, idx, born, disp, fvg, sweep))
+
+// Cassure baissière (clôture sous le dernier swing low) → OB baissier
+if not slBroken and close < slLvl
+    slBroken := true
+    bool born = trend == -1
+    trend := -1
+    int n = math.min(obLookback, bar_index - slBar)
+    if n >= 1
+        [bi, ext] = legExtreme(false, n)
+        [idx, disp] = findOB(false, bi, dispMult * atr)
+        bool fvg   = hasFvg(false, idx, fvgMinAtr * atr)
+        bool sweep = tookLiquidity(shVals, shBars, bar_index - bi, ext, false)
+        addOB(bearOBs, newOB(false, idx, born, disp, fvg, sweep))
+
+[bullEntries, bullFresh] = processOBs(bullOBs)
+[bearEntries, bearFresh] = processOBs(bearOBs)
+
+plot(useHtf ? htfEma : na, "EMA unité supérieure", color.new(color.orange, 30), 2)
+
+// ───────────────────────── Alertes ─────────────────────────
+alertcondition(bullFresh > 0, "Nouvel OB haussier 5★", "Nouvel order block haussier 5★ sur {{ticker}} ({{interval}})")
+alertcondition(bearFresh > 0, "Nouvel OB baissier 5★", "Nouvel order block baissier 5★ sur {{ticker}} ({{interval}})")
+alertcondition(bullEntries > 0, "Retour sur OB haussier 5★ (achat)", "Le prix revient sur un OB haussier 5★ — zone d'achat sur {{ticker}} ({{interval}})")
+alertcondition(bearEntries > 0, "Retour sur OB baissier 5★ (vente)", "Le prix revient sur un OB baissier 5★ — zone de vente sur {{ticker}} ({{interval}})")
+
+// ───────────────────────── Légende ─────────────────────────
+var table legend = table.new(position.top_right, 1, 7, bgcolor = color.new(chart.bg_color, 10), border_width = 1)
+if showLegend and barstate.islast
+    string trendTxt = trend == 1 ? "Tendance actuelle : HAUSSIÈRE" : trend == -1 ? "Tendance actuelle : BAISSIÈRE" : "Tendance actuelle : —"
+    legend.cell(0, 0, "Order Blocks 5★", text_color = chart.fg_color, text_size = size.small)
+    legend.cell(0, 1, "★ OB valide (mouvement violent)", text_color = chart.fg_color, text_size = size.tiny, text_halign = text.align_left)
+    legend.cell(0, 2, "★ En tendance", text_color = chart.fg_color, text_size = size.tiny, text_halign = text.align_left)
+    legend.cell(0, 3, "★ Imbalance (FVG)", text_color = chart.fg_color, text_size = size.tiny, text_halign = text.align_left)
+    legend.cell(0, 4, "★ Non mitigé (vierge)", text_color = chart.fg_color, text_size = size.tiny, text_halign = text.align_left)
+    legend.cell(0, 5, "★ Liquidité chassée", text_color = chart.fg_color, text_size = size.tiny, text_halign = text.align_left)
+    legend.cell(0, 6, trendTxt, text_color = trend == 1 ? #089981 : trend == -1 ? #f23645 : chart.fg_color, text_size = size.tiny, text_halign = text.align_left)
