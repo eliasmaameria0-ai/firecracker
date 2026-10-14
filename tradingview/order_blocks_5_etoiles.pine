@@ -35,7 +35,7 @@ bearCol     = input.color(color.new(#f23645, 75), "OB baissier", group = G3)
 touchCol    = input.color(color.new(#787b86, 85), "OB touché", group = G3)
 
 // ───────────────────────── Types & helpers ─────────────────────────
-type OB
+type OrderBlock
     box   zone
     float top
     float bottom
@@ -100,7 +100,7 @@ hasFvg(bool bull, int idx, float minGap) =>
     found
 
 // La jambe a-t-elle chassé l'un des 2 derniers swings (poche de liquidité) formés avant elle ?
-tookLiquidity(array<float> vals, array<int> bars, int refBar, float extreme, bool bull) =>
+tookLiquidity(array<float> vals, array<int> bars, int refBar, float extreme, bool bull, int maxAge) =>
     bool took    = false
     int  checked = 0
     int  n       = vals.size()
@@ -108,7 +108,7 @@ tookLiquidity(array<float> vals, array<int> bars, int refBar, float extreme, boo
         for j = n - 1 to 0
             int b = bars.get(j)
             if b < refBar
-                if refBar - b > liqLookback or checked >= 2
+                if refBar - b > maxAge or checked >= 2
                     break
                 checked += 1
                 if bull ? extreme < vals.get(j) : extreme > vals.get(j)
@@ -116,14 +116,14 @@ tookLiquidity(array<float> vals, array<int> bars, int refBar, float extreme, boo
                     break
     took
 
-trendOk(OB o) =>
+trendOk(OrderBlock o) =>
     bool structOk = o.bull ? trend == 1 and htfBull : trend == -1 and htfBear
     structOk and (not requireBos or o.bornInTrend)
 
-calcScore(OB o) =>
+calcScore(OrderBlock o) =>
     (o.disp ? 1 : 0) + (trendOk(o) ? 1 : 0) + (o.fvg ? 1 : 0) + (o.touched ? 0 : 1) + (o.sweep ? 1 : 0)
 
-render(OB o) =>
+render(OrderBlock o) =>
     bool  visible = o.score >= minStars and (not o.touched or showTouched)
     color bg      = o.touched ? touchCol : o.bull ? bullCol : bearCol
     string state  = o.dead ? "  ✖ invalidé" : o.touched ? "  touché" : ""
@@ -134,12 +134,12 @@ render(OB o) =>
 newOB(bool bull, int idx, bool born, bool disp, bool fvg, bool sweep) =>
     box b = box.new(bar_index - idx, high[idx], bar_index, low[idx], extend = extend.right,
              text_size = size.small, text_color = chart.fg_color, text_halign = text.align_right)
-    OB.new(b, high[idx], low[idx], bull, bar_index, born, disp, fvg, sweep)
+    OrderBlock.new(b, high[idx], low[idx], bull, bar_index, born, disp, fvg, sweep)
 
-addOB(array<OB> obs, OB o) =>
+addOB(array<OrderBlock> obs, OrderBlock o) =>
     obs.push(o)
     if obs.size() > maxZones
-        OB old = obs.shift()
+        OrderBlock old = obs.shift()
         if old.score < minStars
             old.zone.delete()
         else
@@ -148,12 +148,12 @@ addOB(array<OB> obs, OB o) =>
 
 // Met à jour les zones : note en direct tant que vierge, figée au premier contact.
 // Retourne [nombre d'entrées sur OB 5★, nombre de nouveaux OB 5★].
-processOBs(array<OB> obs) =>
+processOBs(array<OrderBlock> obs) =>
     int entries = 0
     int fresh   = 0
     if obs.size() > 0
         for i = obs.size() - 1 to 0
-            OB o = obs.get(i)
+            OrderBlock o = obs.get(i)
             if not o.touched
                 o.score := calcScore(o)
                 if o.created == bar_index and o.score == 5
@@ -211,8 +211,8 @@ if not na(pl)
         slVals.shift()
         slBars.shift()
 
-var array<OB> bullOBs = array.new<OB>()
-var array<OB> bearOBs = array.new<OB>()
+var array<OrderBlock> bullOBs = array.new<OrderBlock>()
+var array<OrderBlock> bearOBs = array.new<OrderBlock>()
 
 // Cassure haussière (clôture au-dessus du dernier swing high) → OB haussier
 if not shBroken and close > shLvl
@@ -224,7 +224,7 @@ if not shBroken and close > shLvl
         [bi, ext] = legExtreme(true, n)
         [idx, disp] = findOB(true, bi, dispMult * atr)
         bool fvg   = hasFvg(true, idx, fvgMinAtr * atr)
-        bool sweep = tookLiquidity(slVals, slBars, bar_index - bi, ext, true)
+        bool sweep = tookLiquidity(slVals, slBars, bar_index - bi, ext, true, liqLookback)
         addOB(bullOBs, newOB(true, idx, born, disp, fvg, sweep))
 
 // Cassure baissière (clôture sous le dernier swing low) → OB baissier
@@ -237,7 +237,7 @@ if not slBroken and close < slLvl
         [bi, ext] = legExtreme(false, n)
         [idx, disp] = findOB(false, bi, dispMult * atr)
         bool fvg   = hasFvg(false, idx, fvgMinAtr * atr)
-        bool sweep = tookLiquidity(shVals, shBars, bar_index - bi, ext, false)
+        bool sweep = tookLiquidity(shVals, shBars, bar_index - bi, ext, false, liqLookback)
         addOB(bearOBs, newOB(false, idx, born, disp, fvg, sweep))
 
 [bullEntries, bullFresh] = processOBs(bullOBs)
